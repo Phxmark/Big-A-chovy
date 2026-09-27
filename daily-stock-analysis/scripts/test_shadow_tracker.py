@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import shutil
+import copy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,7 +18,12 @@ from shadow_tracker import (
     calculate_t1_for_sample,
     generate_report,
     update_all_t1_metrics,
+    next_trading_day,
+    save_db,
+    init_db,
 )
+import shadow_tracker
+from tools.rule_config import RULE_CONFIG, is_complete_shadow_result
 from a_share_daily_screen import _parse_sina_kline
 from scan_reports import evaluate_low_absorb_candidate
 
@@ -25,6 +31,12 @@ from scan_reports import evaluate_low_absorb_candidate
 class ShadowTrackerTests(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
+        self.calendar_patch = patch(
+            "shadow_tracker.next_trading_day",
+            side_effect=lambda day: {"20260821": "20260824", "20260826": "20260827"}.get(day, "20260824"),
+        )
+        self.calendar_patch.start()
+        self.addCleanup(self.calendar_patch.stop)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -33,7 +45,7 @@ class ShadowTrackerTests(unittest.TestCase):
         """待结算提示不得硬编码历史日期；已有旧标签也应在更新时迁移。"""
         self.assertEqual(
             pending_t1_label(self.test_dir, "20260826"),
-            "待下一个交易日",
+            "待补数据(20260827)",
         )
 
         source_day_dir = os.path.join(self.test_dir, "20260826")
@@ -46,7 +58,7 @@ class ShadowTrackerTests(unittest.TestCase):
 
         self.assertEqual(
             pending_t1_label(self.test_dir, "20260826"),
-            "待下一个交易日(20260827)",
+            "待补数据(20260827)",
         )
 
         db = {
@@ -64,8 +76,9 @@ class ShadowTrackerTests(unittest.TestCase):
             },
         }
         update_all_t1_metrics(db, reports_dir=self.test_dir)
-        self.assertEqual(db["samples"]["coalition"][0]["t1_result"]["t1_date"], "待下一个交易日(20260827)")
-        self.assertNotIn("8/24", db["samples"]["coalition"][0]["t1_result"]["t1_date"])
+        self.assertEqual(db["samples"]["coalition"][0]["t1_result"]["t1_date"], "20260827")
+        self.assertEqual(db["samples"]["coalition"][0]["t1_result"]["missing_reason"], "snapshot_missing")
+        self.assertFalse(is_complete_shadow_result(db["samples"]["coalition"][0]["t1_result"]))
 
     def test_find_next_trading_day_reports_and_exact_0945_metrics(self):
         """测试精准定位次日报告目录，并在多快照(09:40, 09:45, 10:30, 15:00)中精确核算09:45收益与日内最大浮盈/回撤。"""
@@ -147,9 +160,9 @@ class ShadowTrackerTests(unittest.TestCase):
         self.assertFalse(result["extremes_complete"])
         self.assertEqual(result["source"], "report_snapshots_only")
         self.assertEqual(result["t1_0945_price"], 36.40)
-        self.assertEqual(result["t1_max_gain_pct"], "待补算")
-        self.assertEqual(result["t1_max_drawdown_pct"], "待补算")
-        self.assertEqual(result["is_false_breakout"], "待补算")
+        self.assertIsNone(result["t1_max_gain_pct"])
+        self.assertIsNone(result["t1_max_drawdown_pct"])
+        self.assertIsNone(result["is_false_breakout"])
 
     def test_sina_kline_parser_preserves_trade_date(self):
         """新浪备用日K必须保留日期，才能匹配指定T+1交易日。"""
@@ -277,9 +290,98 @@ class ShadowTrackerTests(unittest.TestCase):
 
         output = generate_report(db)
 
-        self.assertIn("| **合力主升主导** | 20 | **20** |", output)
+        self.assertIn("| **合力主升主导** | 20 | **20** | 0 | 20 |", output)
         self.assertIn("🟡 影子数据采集中", output)
         self.assertNotIn("🟢 验证达标", output)
+
+    def test_calendar_uses_index_dates_and_never_skips_missing_report(self):
+        self.calendar_patch.stop()
+        payload = {"data": {"sh000001": {"day": [[day] for day in
+                   ("2026-09-21", "2026-09-22", "2026-09-23")]}}}
+        with patch("tencent_kline.fetch_kline_json", return_value=(payload, "test")):
+            self.assertEqual(next_trading_day("20260921"), "20260922")
+            self.assertIsNone(next_trading_day("20260923"))
+            self.assertIsNone(next_trading_day("20260920"))
+            with open(os.path.join(self.test_dir, "A股筛选结果_20260923_1400.md"), "w") as fp:
+                fp.write("later report")
+            self.assertEqual(find_next_trading_day_reports(self.test_dir, "20260921"), [])
+        with patch("tencent_kline.fetch_kline_json", side_effect=RuntimeError("offline")):
+            self.assertIsNone(next_trading_day("20260921"))
+        self.calendar_patch.start()
+
+    def test_snapshot_window_and_conflict_are_fail_closed(self):
+        sample = {"code": "000603", "date": "20260821", "trigger_price": 10.0}
+        def report(name, minute, price):
+            return {"date": "20260824", "time": minute, "filepath": name,
+                    "tables": {"pool": [{"代码": "000603", "现价": str(price)}]}}
+        cases = {
+            "late": [report("late", "14:00", 11.0)],
+            "early": [report("early", "09:44", 11.0)],
+            "valid": [report("late", "09:47", 12.0), report("first", "09:45", 11.0)],
+            "conflict": [report("a", "09:45", 11.0), report("b", "09:45", 12.0)],
+        }
+        with patch("shadow_tracker.fetch_t1_day_kline_extremes", return_value=(12.0, 9.0)):
+            for case, reports in cases.items():
+                with self.subTest(case=case), patch("shadow_tracker.parse_screening_report", side_effect=reports):
+                    result = calculate_t1_for_sample(sample, [str(i) for i in range(len(reports))])
+                    self.assertEqual(is_complete_shadow_result(result), case == "valid")
+                    self.assertEqual(result["t1_0945_price"], 11.0 if case == "valid" else None)
+                    if case == "valid":
+                        self.assertEqual(result["snapshot_time"], "09:45")
+                        self.assertEqual(result["snapshot_file"], "first")
+
+    def test_wrong_report_date_and_missing_kline_do_not_complete(self):
+        sample = {"code": "000603", "date": "20260821", "trigger_price": 10.0}
+        wrong = {"date": "20260825", "time": "09:45", "filepath": "wrong",
+                 "tables": {"pool": [{"代码": "000603", "现价": "11"}]}}
+        with patch("shadow_tracker.parse_screening_report", return_value=wrong), \
+             patch("shadow_tracker.fetch_t1_day_kline_extremes", return_value=(12.0, 9.0)):
+            result = calculate_t1_for_sample(sample, ["wrong"])
+            self.assertFalse(is_complete_shadow_result(result))
+            self.assertIsNone(result["t1_0945_price"])
+        right = {**wrong, "date": "20260824"}
+        with patch("shadow_tracker.parse_screening_report", return_value=right), \
+             patch("shadow_tracker.fetch_t1_day_kline_extremes", return_value=None):
+            result = calculate_t1_for_sample(sample, ["right"])
+            self.assertFalse(is_complete_shadow_result(result))
+            self.assertEqual(result["t1_0945_price"], 11.0)
+            self.assertIsNone(result["t1_max_gain_pct"])
+
+    def test_save_db_backs_up_and_replaces_atomically(self):
+        original_dir, original_file = shadow_tracker.SHADOW_DATA_DIR, shadow_tracker.SHADOW_DB_FILE
+        self.addCleanup(setattr, shadow_tracker, "SHADOW_DATA_DIR", original_dir)
+        self.addCleanup(setattr, shadow_tracker, "SHADOW_DB_FILE", original_file)
+        shadow_tracker.SHADOW_DATA_DIR = Path(self.test_dir)
+        shadow_tracker.SHADOW_DB_FILE = Path(self.test_dir) / "shadow_samples.json"
+        save_db({"samples": {"a": [1]}})
+        save_db({"samples": {"a": [2]}})
+        self.assertIn('"a": [\n      1', (Path(self.test_dir) / "shadow_samples.json.bak").read_text())
+        self.assertIn('"a": [\n      2', shadow_tracker.SHADOW_DB_FILE.read_text())
+
+    def test_unreadable_existing_db_is_not_replaced(self):
+        original_dir, original_file = shadow_tracker.SHADOW_DATA_DIR, shadow_tracker.SHADOW_DB_FILE
+        self.addCleanup(setattr, shadow_tracker, "SHADOW_DATA_DIR", original_dir)
+        self.addCleanup(setattr, shadow_tracker, "SHADOW_DB_FILE", original_file)
+        shadow_tracker.SHADOW_DATA_DIR = Path(self.test_dir)
+        shadow_tracker.SHADOW_DB_FILE = Path(self.test_dir) / "shadow_samples.json"
+        shadow_tracker.SHADOW_DB_FILE.write_text("broken json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            init_db()
+        self.assertEqual(shadow_tracker.SHADOW_DB_FILE.read_text(), "broken json")
+
+    def test_missing_report_keeps_legacy_result_out_of_new_statistics(self):
+        legacy = {"checked": True, "extremes_complete": True, "source": "daily_kline",
+                  "t1_0945_price": 11.0, "t1_0945_return_pct": 10.0,
+                  "t1_max_gain_pct": 12.0, "t1_max_drawdown_pct": -1.0,
+                  "is_false_breakout": False}
+        db = {"samples": {"coalition": [{"date": "20260821", "code": "000603",
+                                          "trigger_price": 10.0, "t1_result": copy.deepcopy(legacy)}]}}
+        update_all_t1_metrics(db, reports_dir=self.test_dir)
+        self.assertEqual(db["samples"]["coalition"][0]["t1_result"], legacy)
+        self.assertFalse(is_complete_shadow_result(legacy))
+        once = copy.deepcopy(db)
+        update_all_t1_metrics(db, reports_dir=self.test_dir)
+        self.assertEqual(db, once)
 
 
 if __name__ == "__main__":

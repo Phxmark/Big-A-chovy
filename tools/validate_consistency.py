@@ -275,7 +275,7 @@ def check_framework_progress(
     project_root: Path = PROJECT_ROOT,
     db: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, List[Dict[str, str]]]:
-    """分别核对采集数和完整结算进度，未结算不得计入 x/20。"""
+    """公开框架只检查验证目标；实际进度保存在私有影子库。"""
     result = _empty_result()
     framework = _read_text(project_root / "选股框架.md")
     if framework is None:
@@ -291,7 +291,6 @@ def check_framework_progress(
         "sector_boost": "⑧主线板块协同加分器",
         "divergence": "⑨龙头分歧识别",
     }
-    samples = db.get("samples") or {}
     targets = db.get("targets") or {}
     for category, marker in markers.items():
         line = _progress_line(framework, marker)
@@ -299,29 +298,13 @@ def check_framework_progress(
             _add(result, "fail", f"选股框架缺少待验证项：{category}")
             continue
         configured_target = int(RULE_CONFIG["shadow"]["target_samples"])
-        match = re.search(r"完整结算\s*(\d+)\s*/\s*(\d+)", line)
-        collected = re.search(r"已采集\s*(\d+)", line)
-        if not match or not collected:
-            _add(result, "fail", f"选股框架必须分开标注 {category} 的已采集数与完整结算进度")
-            continue
-        reported_count, reported_target = int(match[1]), int(match[2])
-        rows = samples.get(category) or []
-        actual_count = sum(is_complete_shadow_result(row.get("t1_result")) for row in rows if isinstance(row, dict))
-        if int(collected[1]) != len(rows):
-            _add(result, "fail", f"{category} 采集数不一致：框架{collected[1]}，影子库{len(rows)}")
-        if reported_count != actual_count or reported_target != configured_target:
-            _add(
-                result,
-                "fail",
-                f"{category} 进度不一致：框架 {reported_count}/{reported_target}，"
-                f"影子库 {actual_count}/{configured_target}",
-            )
+        match = re.search(r"(\d+)\s*个完整结算样本", line)
+        if not match or int(match[1]) != configured_target:
+            _add(result, "fail", f"{category} 公开框架验证目标与配置不一致")
+        elif (targets.get(category) or {}).get("target_samples") != configured_target:
+            _add(result, "fail", f"{category} 影子库目标值与配置不一致")
         else:
-            db_target = (targets.get(category) or {}).get("target_samples")
-            if db_target != configured_target:
-                _add(result, "fail", f"{category} 影子库目标值为 {db_target}，配置要求 {configured_target}")
-            else:
-                _add(result, "pass", f"{category} 完整结算进度一致：{actual_count}/{configured_target}，已采集{len(rows)}")
+            _add(result, "pass", f"{category} 公开验证目标与配置一致：{configured_target}")
     return result
 
 
@@ -377,7 +360,8 @@ def check_shadow_database(
                 complete += 1
             else:
                 incomplete += 1
-                if isinstance(t1_result, dict) and t1_result.get("checked") is True:
+                if (isinstance(t1_result, dict) and t1_result.get("checked") is True
+                        and t1_result.get("settlement_version") == RULE_CONFIG["shadow"]["settlement_version"]):
                     _add(result, "fail", f"{category}/{sample.get('id', '?')} checked=true 但未满足完整结算口径")
         _add(
             result,

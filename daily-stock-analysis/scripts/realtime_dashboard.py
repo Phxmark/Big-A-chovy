@@ -191,7 +191,7 @@ def _detect_proxy() -> str | None:
 
 _detected_proxy_at_startup = None
 # 启动即实测所有路径（直连+候选代理端口）延迟并缓存，不再依赖系统代理检测
-_startup_paths = network_path.warm_up()
+_startup_paths = [] if os.environ.get("BIG_A_CHOVY_SKIP_STARTUP_PROBE") == "1" else network_path.warm_up()
 if _startup_paths:
     print("[dashboard] network paths: " + ", ".join(
         f"{p['label']}({p['latency_ms']:.0f}ms)" for p in _startup_paths), file=sys.stderr)

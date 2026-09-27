@@ -23,6 +23,8 @@ import json
 import re
 import argparse
 import importlib
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
@@ -44,10 +46,10 @@ from tools.rule_config import (
 
 SHADOW_DATA_DIR = Path(__file__).resolve().parent / "shadow_data"
 SHADOW_DB_FILE = SHADOW_DATA_DIR / "shadow_samples.json"
-T1_PENDING = "待补算"
 T1_SOURCE_DAILY_KLINE = "daily_kline"
 T1_SOURCE_REPORT_SNAPSHOTS_ONLY = "report_snapshots_only"
 T1_SOURCE_UNAVAILABLE = "unavailable"
+SETTLEMENT_VERSION = RULE_CONFIG["shadow"]["settlement_version"]
 
 
 def init_db() -> Dict[str, Any]:
@@ -65,8 +67,9 @@ def init_db() -> Dict[str, Any]:
                     data["targets"].setdefault(category, dict(meta))
                     data["samples"].setdefault(category, [])
                 return data
-        except Exception:
-            pass
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"影子样本库无法读取，已停止以避免覆盖：{SHADOW_DB_FILE}") from exc
+        raise ValueError(f"影子样本库结构无效，已停止以避免覆盖：{SHADOW_DB_FILE}")
     return {
         "version": "2.0",
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -79,7 +82,22 @@ def save_db(db: Dict[str, Any]) -> None:
     """持久化保存影子样本数据库。"""
     SHADOW_DATA_DIR.mkdir(parents=True, exist_ok=True)
     db["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    SHADOW_DB_FILE.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(db, ensure_ascii=False, indent=2)
+    if SHADOW_DB_FILE.exists():
+        backup = SHADOW_DB_FILE.with_name(SHADOW_DB_FILE.name + ".bak")
+        shutil.copy2(SHADOW_DB_FILE, backup)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=SHADOW_DATA_DIR,
+                                         prefix=".shadow-", suffix=".tmp", delete=False) as fp:
+            tmp_path = Path(fp.name)
+            fp.write(payload)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp_path, SHADOW_DB_FILE)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def is_number(val: Any) -> bool:
@@ -241,40 +259,39 @@ def collect_samples_from_report(filepath: str, db: Dict[str, Any]) -> int:
     return added_count
 
 
-def find_next_trading_day_reports(reports_dir: str, date_str: str) -> List[str]:
-    """寻找指定日期的下一个交易日报告文件（支持递归子目录与各类文件名）。"""
-    dates_set = set()
-    if os.path.exists(reports_dir):
-        for root, dirs, files in os.walk(reports_dir):
-            for d in dirs:
-                if re.match(r"^\d{8}$", d):
-                    dates_set.add(d)
-            for f in files:
-                if f.endswith(".md"):
-                    m = re.search(r"(\d{8})", f)
-                    if m:
-                        dates_set.add(m.group(1))
-
-    sorted_dates = sorted(list(dates_set))
-    if date_str in sorted_dates:
-        idx = sorted_dates.index(date_str)
-        if idx + 1 < len(sorted_dates):
-            next_date = sorted_dates[idx + 1]
-            return get_report_files(reports_dir, next_date)
-    return []
-
-
-def pending_t1_label(reports_dir: str, date_str: str) -> str:
-    """生成待结算提示；有下一交易日报告时带真实日期，否则不猜日期。"""
+def next_trading_day(date_str: str) -> Optional[str]:
+    """从上证指数日 K 确认 T+1；数据未覆盖目标时不猜测。"""
     try:
-        next_reports = find_next_trading_day_reports(reports_dir, date_str)
-        if next_reports:
-            next_date = parse_screening_report(next_reports[0]).get("date")
-            if next_date:
-                return f"待下一个交易日({next_date})"
-    except Exception:
-        pass
-    return "待下一个交易日"
+        day = datetime.strptime(date_str, "%Y%m%d")
+        tencent_kline = importlib.import_module("tencent_kline")
+        payload, _ = tencent_kline.fetch_kline_json(
+            "sh000001", 40,
+            start=(day - timedelta(days=7)).strftime("%Y-%m-%d"),
+            end=(day + timedelta(days=30)).strftime("%Y-%m-%d"),
+        )
+        dates = sorted({str(row[0]).replace("-", "") for row in
+                        tencent_kline.kline_rows(payload, "sh000001")
+                        if row and re.fullmatch(r"\d{4}-?\d{2}-?\d{2}", str(row[0]))})
+        if date_str not in dates:
+            return None
+        index = dates.index(date_str)
+        return dates[index + 1] if index + 1 < len(dates) else None
+    except (ValueError, RuntimeError, OSError, IndexError):
+        return None
+
+
+def find_next_trading_day_reports(reports_dir: str, date_str: str,
+                                  expected_date: Optional[str] = None) -> List[str]:
+    """只返回指数日 K 确认的 T+1 当日报告；漏采不顺延。"""
+    next_date = expected_date or next_trading_day(date_str)
+    return get_report_files(reports_dir, next_date) if next_date else []
+
+
+def pending_t1_label(reports_dir: str, date_str: str,
+                     expected_date: Optional[str] = None) -> str:
+    """日期由指数日 K 确认，不依赖是否存在报告。"""
+    next_date = expected_date or next_trading_day(date_str)
+    return f"待补数据({next_date})" if next_date else "交易日期待确认"
 
 
 def fetch_t1_day_kline_extremes(code: str, t1_date: str) -> Optional[Tuple[float, float]]:
@@ -295,130 +312,122 @@ def fetch_t1_day_kline_extremes(code: str, t1_date: str) -> Optional[Tuple[float
     return None
 
 
-def calculate_t1_for_sample(sample: Dict[str, Any], t1_reports: List[str]) -> Optional[Dict[str, Any]]:
-    """根据 T+1 次日报告与日K全日极值真实核算 09:45 收益、最大浮盈、最大回撤与假突破。"""
-    if not t1_reports:
+def calculate_t1_for_sample(sample: Dict[str, Any], t1_reports: List[str],
+                            expected_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """用已确认的交易日、目标窗口快照和当日日 K 结算影子样本。"""
+    expected_date = expected_date or next_trading_day(sample.get("date", ""))
+    if not expected_date:
         return None
-
     code = sample["code"]
     trigger_price = float(sample["trigger_price"])
     if trigger_price <= 0:
         return None
 
-    # 扫描次日所有快照，按共享配置中的目标时刻锁定 T+1 目标价格。
-    best_0945_diff = float("inf")
-    p_0945 = None
-    all_prices = []
-    t1_date = None
-
+    target = hhmm_to_minutes(RULE_CONFIG["shadow"]["snapshot_target"])
+    latest = hhmm_to_minutes(RULE_CONFIG["shadow"]["snapshot_latest"])
+    candidates: Dict[int, Dict[float, str]] = {}
     for r_file in t1_reports:
         try:
             rep = parse_screening_report(r_file)
-            t1_date = rep["date"]
-            t_str = rep.get("time", "")
-
-            # 计算与配置目标时刻的时间差
-            time_diff = float("inf")
-            m = re.match(r"^(\d{1,2}):(\d{2})", t_str)
-            if m:
-                h, mi = int(m.group(1)), int(m.group(2))
-                target_minute = hhmm_to_minutes(
-                    RULE_CONFIG["execution"]["t1_exit_window"]["target"]
-                )
-                time_diff = abs((h * 60 + mi) - target_minute)
-
-            for table_name, rows in rep.get("tables", {}).items():
-                for row in rows:
-                    if row.get("代码") == code:
-                        price = parse_val(row.get("现价") or row.get("当前价") or row.get("价格"))
-                        if price > 0:
-                            all_prices.append(price)
-                            # 提取表格中可能记录的最高价与最低价
-                            if is_number(row.get("最高")):
-                                all_prices.append(parse_val(row.get("最高")))
-                            if is_number(row.get("最低")):
-                                all_prices.append(parse_val(row.get("最低")))
-
-                            # 精确锁定距 09:45 最近的时间点
-                            if time_diff < best_0945_diff:
-                                best_0945_diff = time_diff
-                                p_0945 = price
-        except Exception:
+        except (OSError, ValueError):
             continue
+        if rep.get("date") != expected_date:
+            continue
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", rep.get("time", ""))
+        if not match:
+            continue
+        minute = int(match[1]) * 60 + int(match[2])
+        if not target <= minute <= latest:
+            continue
+        for rows in rep.get("tables", {}).values():
+            for row in rows:
+                if row.get("代码") == code:
+                    price = parse_val(row.get("现价") or row.get("当前价") or row.get("价格"))
+                    if price > 0:
+                        candidates.setdefault(minute, {}).setdefault(price, rep.get("filepath") or r_file)
 
-    if not all_prices:
-        return None
+    snapshot_time = snapshot_file = snapshot_price = None
+    reason = "snapshot_missing"
+    if candidates:
+        first = min(candidates)
+        if len(candidates[first]) == 1:
+            snapshot_price, snapshot_file = next(iter(candidates[first].items()))
+            snapshot_time = f"{first // 60:02d}:{first % 60:02d}"
+            reason = None
+        else:
+            reason = "snapshot_conflict"
 
-    if p_0945 is None:
-        p_0945 = all_prices[0]
-
-    # 结合日K获取全日真实极值（防止中途退出候选表导致漏统计日内极值）。
-    # 日K缺失时只能保留09:45快照收益，严禁用筛选快照冒充全日极值闭环。
-    day_extremes = fetch_t1_day_kline_extremes(code, t1_date) if t1_date else None
-    if day_extremes is not None:
-        extremes_complete = True
-        p_high = max(max(all_prices), day_extremes[0])
-        p_low = min(min(all_prices), day_extremes[1])
-    else:
-        extremes_complete = False
-
-    t1_ret = (p_0945 - trigger_price) / trigger_price * 100
+    day_extremes = fetch_t1_day_kline_extremes(code, expected_date) if candidates else None
+    extremes_complete = day_extremes is not None
     if extremes_complete:
-        max_gain = round((p_high - trigger_price) / trigger_price * 100, 2)
-        max_dd = round((p_low - trigger_price) / trigger_price * 100, 2)
+        high, low = day_extremes
+        max_gain = round((high - trigger_price) / trigger_price * 100, 2)
+        max_dd = round((low - trigger_price) / trigger_price * 100, 2)
         stop_pct = float(RULE_CONFIG["shadow"]["false_breakout_stop_pct"])
-        is_false_breakout: Any = p_low < trigger_price * (1.0 - stop_pct / 100.0)
-        extremes_source = T1_SOURCE_DAILY_KLINE
+        is_false_breakout = low < trigger_price * (1.0 - stop_pct / 100.0)
     else:
-        max_gain = T1_PENDING
-        max_dd = T1_PENDING
-        is_false_breakout = T1_PENDING
-        extremes_source = T1_SOURCE_REPORT_SNAPSHOTS_ONLY
-
+        max_gain = max_dd = is_false_breakout = None
+        if reason is None:
+            reason = "daily_kline_missing"
+    complete = snapshot_price is not None and extremes_complete
     return {
-        # checked 表示完整T+1结算，不是“找到了某个报告快照”。
-        "checked": extremes_complete,
-        "t1_date": t1_date or "次日",
-        "t1_0945_price": round(p_0945, 2),
-        "t1_0945_return_pct": round(t1_ret, 2),
+        "settlement_version": SETTLEMENT_VERSION,
+        "checked": complete,
+        "date_confirmed": True,
+        "calendar_source": "tencent_sh000001_daily_kline",
+        "t1_date": expected_date,
+        "snapshot_valid": snapshot_price is not None,
+        "snapshot_time": snapshot_time,
+        "snapshot_file": snapshot_file,
+        "snapshot_precision": "minute" if snapshot_time else None,
+        "snapshot_target": RULE_CONFIG["shadow"]["snapshot_target"],
+        "snapshot_latest": RULE_CONFIG["shadow"]["snapshot_latest"],
+        "missing_reason": reason,
+        "t1_0945_price": round(snapshot_price, 2) if snapshot_price is not None else None,
+        "t1_0945_return_pct": round((snapshot_price - trigger_price) / trigger_price * 100, 2)
+        if snapshot_price is not None else None,
         "t1_max_gain_pct": max_gain,
         "t1_max_drawdown_pct": max_dd,
         "is_false_breakout": is_false_breakout,
         "extremes_complete": extremes_complete,
-        "source": extremes_source,
+        "source": T1_SOURCE_DAILY_KLINE if extremes_complete else T1_SOURCE_REPORT_SNAPSHOTS_ONLY,
     }
 
 
 def update_all_t1_metrics(db: Dict[str, Any], reports_dir: Optional[str] = None) -> None:
     """自动核算所有样本的 T+1 次日真实表现（含 divergence 等全部机制类别）。"""
     reports_dir = reports_dir or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "筛选结果"))
+    date_cache: Dict[str, Optional[str]] = {}
     for category in sorted(db["samples"].keys()):
         for sample in db["samples"][category]:
             date_str = sample["date"]
-            t1_reports = find_next_trading_day_reports(reports_dir, date_str)
+            if date_str not in date_cache:
+                date_cache[date_str] = next_trading_day(date_str)
+            expected_date = date_cache[date_str]
+            t1_reports = find_next_trading_day_reports(reports_dir, date_str, expected_date) if expected_date else []
             if t1_reports:
-                res = calculate_t1_for_sample(sample, t1_reports)
+                res = calculate_t1_for_sample(sample, t1_reports, expected_date)
                 if res:
                     sample["t1_result"] = res
             if sample.get("t1_result") is None:
                 sample["t1_result"] = {
+                    "settlement_version": SETTLEMENT_VERSION,
                     "checked": False,
-                    "t1_date": pending_t1_label(reports_dir, date_str),
+                    "date_confirmed": expected_date is not None,
+                    "calendar_source": "tencent_sh000001_daily_kline" if expected_date else None,
+                    "t1_date": pending_t1_label(reports_dir, date_str, expected_date),
+                    "snapshot_valid": False,
+                    "snapshot_time": None,
+                    "snapshot_file": None,
+                    "missing_reason": "report_missing" if expected_date else "date_unconfirmed",
                     "t1_0945_price": None,
                     "t1_0945_return_pct": None,
-                    "t1_max_gain_pct": T1_PENDING,
-                    "t1_max_drawdown_pct": T1_PENDING,
-                    "is_false_breakout": T1_PENDING,
+                    "t1_max_gain_pct": None,
+                    "t1_max_drawdown_pct": None,
+                    "is_false_breakout": None,
                     "extremes_complete": False,
                     "source": T1_SOURCE_UNAVAILABLE,
                 }
-            elif (
-                isinstance(sample.get("t1_result"), dict)
-                and not sample["t1_result"].get("checked")
-                and sample["t1_result"].get("source") == T1_SOURCE_UNAVAILABLE
-            ):
-                # 迁移旧版本写入的固定日期提示，避免历史样本继续显示错误日期。
-                sample["t1_result"]["t1_date"] = pending_t1_label(reports_dir, date_str)
 
 
 def generate_report(db: Dict[str, Any]) -> str:
@@ -428,8 +437,9 @@ def generate_report(db: Dict[str, Any]) -> str:
     lines.append(f"**更新时点**：`{db.get('last_updated', '-')}` ｜ **风控状态**：`待验证 · 仅模拟仓权限`\n")
 
     lines.append("## 一、四大待验证项目进度汇总")
-    lines.append("| 待验证项目 | 目标样本 | 已收集样本 | 收集完成度 | 胜率 (09:45>0) | 平均 09:45 收益 | 平均最大浮盈 | 平均最大回撤 | 假突破率 | 当前状态 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("09:45 附近快照收益使用 09:45–09:47 的首个有效快照，不代表实际成交收益。最大不利波动是相对触发价的日内最低价跌幅，不是账户最大回撤。")
+    lines.append("| 待验证项目 | 目标样本 | 已收集 | 完整结算 | 待补数据 | 收集完成度 | 胜率 (快照收益>0) | 平均快照收益 | 平均最大浮盈 | 平均最大不利波动 | 假突破率 | 当前状态 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
 
     for cat, meta in db["targets"].items():
         samples = db["samples"].get(cat, [])
@@ -439,12 +449,7 @@ def generate_report(db: Dict[str, Any]) -> str:
 
         # 计算指标
         evaluated_samples = [s for s in samples if is_complete_shadow_result(s.get("t1_result"))]
-        pending_extremes = any(
-            s.get("t1_result")
-            and s["t1_result"].get("extremes_complete") is False
-            and s["t1_result"].get("t1_0945_price") is not None
-            for s in samples
-        )
+        complete_count = len(evaluated_samples)
         if evaluated_samples:
             wins = sum(1 for s in evaluated_samples if (s["t1_result"].get("t1_0945_return_pct") or 0) > 0)
             win_rate = f"{wins / len(evaluated_samples) * 100:.1f}%"
@@ -453,25 +458,21 @@ def generate_report(db: Dict[str, Any]) -> str:
             avg_dd = f"{sum(s['t1_result']['t1_max_drawdown_pct'] for s in evaluated_samples) / len(evaluated_samples):+.2f}%"
             false_bo = f"{sum(1 for s in evaluated_samples if s['t1_result'].get('is_false_breakout')) / len(evaluated_samples) * 100:.1f}%"
         else:
-            win_rate = "0.0% (待补算日K极值)" if pending_extremes else "0.0% (待下一个交易日结算)"
-            avg_ret = "0.00%"
-            avg_gain = "0.00%"
-            avg_dd = "0.00%"
-            false_bo = "0.0%"
+            win_rate = avg_ret = avg_gain = avg_dd = false_bo = "待补数据"
 
         status = (
             "🟢 验证达标"
             if count >= target and len(evaluated_samples) >= target
             else "🟡 影子数据采集中"
         )
-        lines.append(f"| **{meta['name']}** | {target} | **{count}** | {pct:.1f}% | {win_rate} | {avg_ret} | {avg_gain} | {avg_dd} | {false_bo} | {status} |")
+        lines.append(f"| **{meta['name']}** | {target} | **{count}** | {complete_count} | {count - complete_count} | {pct:.1f}% | {win_rate} | {avg_ret} | {avg_gain} | {avg_dd} | {false_bo} | {status} |")
 
     lines.append("\n## 二、当前已入库影子样本明细")
     for cat, meta in db["targets"].items():
         samples = db["samples"].get(cat, [])
         lines.append(f"\n### 📌 {meta['name']} 样本池 ({len(samples)}/{meta['target_samples']})")
         if samples:
-            lines.append("| 样本ID | 代码 | 名称 | 入库日期 | 触发时点 | 触发价 | 板块 | 关键量化特征 | T+1 09:45 收益 | 结算状态 |")
+            lines.append("| 样本ID | 代码 | 名称 | 入库日期 | 触发时点 | 触发价 | 板块 | 关键量化特征 | T+1 09:45 附近快照收益 | 结算状态 |")
             lines.append("|---|---|---|---|---|---|---|---|---|---|")
             for s in samples:
                 feat = (
@@ -484,13 +485,14 @@ def generate_report(db: Dict[str, Any]) -> str:
                 )
                 t1_res = s.get("t1_result") or {}
                 t1_txt = t1_res.get("t1_0945_return_pct")
-                t1_disp = f"{t1_txt:+.2f}%" if t1_txt is not None else "-"
-                if t1_res.get("checked") and t1_res.get("extremes_complete") is True:
-                    status_disp = f"✅ 已核算({t1_res.get('t1_date')})"
-                elif t1_res.get("extremes_complete") is False and t1_res.get("t1_0945_price") is not None:
-                    status_disp = f"⏳ 待补算日K极值({t1_res.get('source', T1_SOURCE_REPORT_SNAPSHOTS_ONLY)})"
+                t1_disp = f"{t1_txt:+.2f}%" if isinstance(t1_txt, (int, float)) else "待补数据"
+                if is_complete_shadow_result(t1_res):
+                    status_disp = f"✅ 已核算({t1_res.get('t1_date')} {t1_res.get('snapshot_time')})"
+                elif t1_res.get("settlement_version") != SETTLEMENT_VERSION and t1_res:
+                    t1_disp = "旧口径待重算"
+                    status_disp = "⏳ 旧口径待重算"
                 else:
-                    status_disp = "⏳ 待下一个交易日结算"
+                    status_disp = f"⏳ 待补数据({t1_res.get('missing_reason', 'unavailable')})"
                 lines.append(f"| `{s['id']}` | {s['code']} | {s['name']} | {s['date']} | {s['trigger_time']} | {s['trigger_price']:.2f} | {s['plate']} | {feat} | {t1_disp} | {status_disp} |")
         else:
             lines.append("*（暂无样本）*")
@@ -504,7 +506,7 @@ def scan_and_update(date_str: Optional[str] = None) -> None:
     # 全日序列判定维护，本扫描原样保留，避免重建核心三类时被覆盖清除。
     previous = init_db()
     db = {
-        "version": "2.0",
+        "version": "3.0",
         "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "targets": shadow_targets(),
         "samples": {category: [] for category in ("coalition", "breakout", "sector_boost")},
@@ -521,6 +523,20 @@ def scan_and_update(date_str: Optional[str] = None) -> None:
     for f in files:
         added = collect_samples_from_report(f, db)
         total_added += added
+
+    for category in ("coalition", "breakout", "sector_boost"):
+        existing_keys = {(row.get("code"), row.get("date")) for row in db["samples"][category]}
+        for old in previous.get("samples", {}).get(category, []):
+            if isinstance(old, dict) and (old.get("code"), old.get("date")) not in existing_keys:
+                db["samples"][category].append(old)
+                existing_keys.add((old.get("code"), old.get("date")))
+        old_results = {
+            (row.get("code"), row.get("date")): row.get("t1_result")
+            for row in previous.get("samples", {}).get(category, [])
+            if isinstance(row, dict)
+        }
+        for row in db["samples"][category]:
+            row["t1_result"] = old_results.get((row.get("code"), row.get("date")))
 
     update_all_t1_metrics(db)
     save_db(db)
