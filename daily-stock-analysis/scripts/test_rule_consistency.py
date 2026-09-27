@@ -68,7 +68,15 @@ class RuleConsistencyTests(unittest.TestCase):
 
     def test_complete_shadow_result_requires_daily_kline_and_all_metrics(self):
         incomplete = {
+            "settlement_version": RULE_CONFIG["shadow"]["settlement_version"],
             "checked": True,
+            "date_confirmed": True,
+            "t1_date": "20260824",
+            "snapshot_valid": True,
+            "snapshot_time": "09:45",
+            "snapshot_file": "report.md",
+            "snapshot_target": "09:45",
+            "snapshot_latest": "09:47",
             "extremes_complete": True,
             "source": "report_snapshots_only",
             "t1_0945_price": 10.0,
@@ -94,6 +102,7 @@ class RuleConsistencyTests(unittest.TestCase):
                 "code": "000001",
                 "date": "20260827",
                 "t1_result": {
+                    "settlement_version": RULE_CONFIG["shadow"]["settlement_version"],
                     "checked": True,
                     "extremes_complete": False,
                     "source": "report_snapshots_only",
@@ -107,15 +116,18 @@ class RuleConsistencyTests(unittest.TestCase):
     def test_progress_uses_completed_results_not_collected_signals(self):
         db = {"targets": shadow_targets(), "samples": {key: [] for key in shadow_targets()}}
         db["samples"]["coalition"] = [{"t1_result": None} for _ in range(4)]
-        text = (PROJECT_ROOT / "选股框架.md").read_text(encoding="utf-8")
-        # 用实际文档结构构造4条未结算信号，正确完成数为0。
         db["samples"]["divergence"] = [{"t1_result": None} for _ in range(4)]
-        text = text.replace("已采集4；完整结算1/20", "已采集4；完整结算0/20")
+        rows = [
+            "| ⑥合力主升主导验证 | 20个完整结算样本 |",
+            "| ⑦观察池突破状态机 | 20个完整结算样本 |",
+            "| ⑧主线板块协同加分器 | 20个完整结算样本 |",
+            "| ⑨龙头分歧识别 | 20个完整结算样本 |",
+        ]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "选股框架.md").write_text(text, encoding="utf-8")
+            (root / "选股框架.md").write_text("\n".join(rows), encoding="utf-8")
             self.assertFalse(check_framework_progress(root, db)["fail"])
-            (root / "选股框架.md").write_text(encoding="utf-8", data=text.replace("已采集4；完整结算0/20", "已采集4；完整结算4/20"))
+            (root / "选股框架.md").write_text("\n".join(rows).replace("⑥合力主升主导验证 | 20个", "⑥合力主升主导验证 | 19个"), encoding="utf-8")
             self.assertTrue(check_framework_progress(root, db)["fail"])
 
     def test_current_workspace_has_no_consistency_failures(self):

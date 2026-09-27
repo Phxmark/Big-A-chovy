@@ -263,6 +263,7 @@ python3 tools/detect_divergence_leader.py --date 20260824 --record
 | `daily-stock-analysis/scripts/intersection_state.json` | 交集状态机跨快照状态 | 否，运行时自动重建 |
 | `daily-stock-analysis/scripts/watchlist_breakout_state.json` | 观察池突破状态机 | 否，运行时自动重建 |
 | `tools/shadow_data/shadow_samples.json` | 影子验证样本和 T+1 结算 | 否 |
+| `tools/shadow_data/shadow_samples.json.bak` | 影子样本库写入前备份 | 否 |
 
 这些文件不存在时，程序会使用空状态或重新拉取数据。删除缓存通常只会导致下一次运行较慢；删除持仓、决策记录或状态文件会丢失相应的本地信息，应先备份。
 

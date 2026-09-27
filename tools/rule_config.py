@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from math import isfinite
+import re
 from typing import Any, Dict
 
 
@@ -421,6 +422,9 @@ RULE_CONFIG: Dict[str, Any] = {
         "target_samples": 20,
         "false_breakout_stop_pct": 1.5,
         "required_complete_source": "daily_kline",
+        "settlement_version": "20260927-v1",
+        "snapshot_target": "09:45",
+        "snapshot_latest": "09:47",
         "categories": {
             "coalition": "合力主升主导",
             "breakout": "观察池突破状态机",
@@ -481,6 +485,23 @@ def is_complete_shadow_result(result: Any) -> bool:
     计入胜率、极值统计或 20 样本达标判断。
     """
     if not isinstance(result, dict):
+        return False
+    if result.get("settlement_version") != RULE_CONFIG["shadow"]["settlement_version"]:
+        return False
+    if result.get("date_confirmed") is not True or result.get("snapshot_valid") is not True:
+        return False
+    shadow = RULE_CONFIG["shadow"]
+    if not re.fullmatch(r"\d{8}", str(result.get("t1_date", ""))):
+        return False
+    if not result.get("snapshot_file"):
+        return False
+    try:
+        actual = hhmm_to_minutes(result.get("snapshot_time"))
+    except ValueError:
+        return False
+    if not hhmm_to_minutes(shadow["snapshot_target"]) <= actual <= hhmm_to_minutes(shadow["snapshot_latest"]):
+        return False
+    if result.get("snapshot_target") != shadow["snapshot_target"] or result.get("snapshot_latest") != shadow["snapshot_latest"]:
         return False
     if result.get("checked") is not True:
         return False
